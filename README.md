@@ -1,6 +1,6 @@
 # lcm
 
-lcm is a fork of [seqax by MatX](https://github.com/MatX-inc/seqax) modified to run on Google's TPU v4-32s and uses the framework outlined by Meta in [Large Concept Models: Language Modeling in a Sentence Representation Space](https://arxiv.org/pdf/2412.08821) as a technique to compress the KVCache. More details on the implementation and experiments can be read [here](./docs/lcm.ipynb).
+lcm is a fork of [seqax by MatX](https://github.com/MatX-inc/seqax) modified to run on Google's TPU v4-32s and uses the framework outlined by Meta in [Large Concept Models: Language Modeling in a Sentence Representation Space](https://arxiv.org/pdf/2412.08821) as a technique to compress the KV Cache. More details on the implementation and experiments can be read [here](./docs/lcm.ipynb).
 
 The installation procedure is identical to that described in [seqax](https://github.com/MatX-inc/seqax).
 
