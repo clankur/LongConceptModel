@@ -57,13 +57,6 @@ from jax.tree_util import tree_leaves
 
 PRNGKey = Any
 
-# TODO:
-# 3 Stages
-# depending on the stage mask is different
-#   1. mask is all 1s for everything within chunk and previous chunks, shape (L, L)
-#   2. mask is standard causal mask, shape (block_size, block_size)
-#   3. mask is standard causal mask, shape (L, L)
-
 
 @dataclass(frozen=True)
 class BaseWidths:
@@ -81,7 +74,7 @@ class Hparams:
     n_kv: int
     d_head: int
     d_ff: int
-    block_size: int
+    concept_size: int
 
     vocab: int
     layers: int  # Number of concept decoder layers
@@ -264,7 +257,7 @@ class Model:
     x_lnz: f32["n_t_layers d_model/t/d"]
 
     # weights for weighted token-concept reduction
-    w_mix: f32["block_size 1"]
+    w_mix: f32["concept_size 1"]
     w_reduce_q: f32["1 n_q_per_kv n_kv/t d_head/d"]
     w_reduce_kv: f32["2 d_model/d n_kv/t d_head"]
     w_reduce_o: f32["d_model/d n_q_per_kv n_kv/t d_head"]
@@ -439,9 +432,9 @@ class Model:
         x_lnz = jnp.ones((h.n_t_layers, h.d_model), dtype=jnp.float32)
 
         # Initialize w_mix for weighted sum reduction
-        block_size_scale = (1.0 / math.sqrt(h.block_size)) ** p.hidden_param_mult
-        w_mix = block_size_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "w_mix"), -2, 2, (h.block_size, 1), dtype=jnp.float32
+        concept_size_scale = (1.0 / math.sqrt(h.concept_size)) ** p.hidden_param_mult
+        w_mix = concept_size_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_mix"), -2, 2, (h.concept_size, 1), dtype=jnp.float32
         )
 
         # Initialize w_reduce_q as a learned query vector
@@ -529,7 +522,7 @@ class Model:
         embed_x = x = shardops.psum_scatter("B/d L M -> B/d L M/t", x)
 
         L = ids.shape[1]
-        n_blocks = L // h.block_size
+        n_blocks = L // h.concept_size
         segment_ids = jnp.cumsum(is_seq_start, axis=1)
         segment_mask: bool_[b"B/d L L"] = (
             segment_ids[:, :, jnp.newaxis] == segment_ids[:, jnp.newaxis, :]
@@ -541,33 +534,30 @@ class Model:
             jnp.ones((L, L), dtype=jnp.bool_), 0
         )[jnp.newaxis, ..., jnp.newaxis, jnp.newaxis]
         causal_mask: bool_[b"B/d L L 1 1"] = jnp.logical_and(segment_mask, causal_mask)
-        chunk_indices = jnp.arange(L) // h.block_size
+        chunk_indices = jnp.arange(L) // h.concept_size
         encoder_mask = chunk_indices[:, None] > chunk_indices[None, :]
         encoder_mask = encoder_mask[jnp.newaxis, ..., jnp.newaxis, jnp.newaxis]
         concept_causal_mask = jnp.tril(jnp.ones((n_blocks, n_blocks), dtype=jnp.bool_))[
             jnp.newaxis, ..., jnp.newaxis, jnp.newaxis
         ]
         q_pos = jnp.arange(L)
-        k_pos = jnp.arange(L // h.block_size)
-        x_causal_mask = q_pos[:, None] // h.block_size > k_pos[None, :]
+        k_pos = jnp.arange(L // h.concept_size)
+        x_causal_mask = q_pos[:, None] // h.concept_size > k_pos[None, :]
         x_causal_mask = x_causal_mask[jnp.newaxis, ..., jnp.newaxis, jnp.newaxis]
 
         rope_table = RopeTable.create(L, h)
-        x_rope_table = RopeTable.create(L, h, h.block_size)
+        x_rope_table = RopeTable.create(L, h, h.concept_size)
         concept_rope_table = RopeTable.create(n_blocks, h)
-
-        # Encoder block
-        #  need weights for e_w_q, e_w_kv, e_w_o, e_w_gate, e_w_up, e_w_down, e_ln1, e_ln2
-        #  Encodes chunks of the input into a concept embedding
-        #     - Input: chunks of the input, Mask enabling attending to tokens within the same chunk AND to previous chunks
-        #     - perform standard attention on the chunks with this mask
-        #     - reduce for each chunk BLOCK_SIZE to a single embedding
 
         @explicit_activation_checkpointing
         @typechecked
         def encoder_block(
             x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer
         ) -> Tuple[bf16[b"B/d L M/t"], Tuple[()]]:
+            #  Encodes chunks of the input into a concept embedding
+            #     - Input: chunks of the input, Mask enabling attending to tokens within the same chunk AND to previous chunks
+            #     - perform standard attention on the chunks with this mask
+
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -658,7 +648,6 @@ class Model:
 
             return jnp.bfloat16(x), ()
 
-        # Concept decoder block
         @explicit_activation_checkpointing
         @typechecked
         def concept_decoder_block(
@@ -761,22 +750,22 @@ class Model:
 
             return jnp.bfloat16(x + ffn_out), ()
 
-        # Token decoder
-        #  3. Token Decoder that decodes concept embedding to get the output tokens
-        #     - Input: output concept embedding (z) from CausalEmbedding, Mask enabling attending to previous tokens
-        #     - get tokenized embeddings, apply standard attention on them, get out, use x = x + out
-        #     - apply cross attention
-        #           - apply x_wq to x to get queries, apply x_wkv to z get keys and values
-        #           - standard decoder after this with MLP
-        #     - each embedding gets mapped back to a BLOCK_SIZE and we join them to form the sequence?
+            # Token decoder block
 
-        # Token decoder block
         @explicit_activation_checkpointing
         @typechecked
         def token_decoder_block(
             carry: Tuple[bf16[b"B/d L M/t"], bf16[b"B/d n_blocks M/t"]],
             layer_weights: Tuple[TransformerLayer, Any],
         ) -> Tuple[Tuple[bf16[b"B/d L M/t"], bf16[b"B/d n_blocks M/t"]], Tuple[()]]:
+            #  Token Decoder that decodes concept embedding to get the output tokens
+            #     - Input: output concept embedding (z) from CausalEmbedding, Mask enabling attending to previous tokens
+            #     - get tokenized embeddings, apply standard attention on them, get out, use x = x + out
+            #     - apply cross attention
+            #           - apply x_wq to x to get queries, apply x_wkv to z get keys and values
+            #           - standard decoder after this with MLP
+            #     - each embedding gets mapped back to a CONCEPT_SIZE and we join them to form the sequence?
+
             x, z = carry
             transformer_weights, cross_attn_weights = layer_weights
             x_w_q, x_w_kv, x_w_o, x_lnx, x_lnz = cross_attn_weights
@@ -930,23 +919,24 @@ class Model:
         x = shardops.psum_scatter("B/d L M -> B/d L M/t", x)
         x = einops.rearrange(
             x,
-            "B (n_blocks block_size) M -> B n_blocks block_size M",
+            "B (n_blocks concept_size) M -> B n_blocks concept_size M",
             n_blocks=n_blocks,
         )
-        # reduce for each chunk of block_size to a single embedding
+
+        # reduce for each chunk of concept_size to a single embedding
         if h.reduction_strategy == "sum" or h.reduction_strategy == "max":
             x = einops.reduce(
-                x, "B n_blocks block_size M -> B n_blocks M", h.reduction_strategy
+                x, "B n_blocks concept_size M -> B n_blocks M", h.reduction_strategy
             )
         elif h.reduction_strategy == "wei_sum":
             x = shardops.einsum_unreduced(
-                "B/d n_blocks block_size M/t, block_size 1 -> B/d n_blocks M/t",
+                "B/d n_blocks concept_size M/t, concept_size 1 -> B/d n_blocks M/t",
                 x,
                 self.w_mix,
             )
         elif h.reduction_strategy == "attn":
             x = shardops.all_gather(
-                "B/d n_blocks block_size M/t -> B/d n_blocks block_size M", x
+                "B/d n_blocks concept_size M/t -> B/d n_blocks concept_size M", x
             )
 
             w_reduce_q = shardops.all_gather(
@@ -960,12 +950,12 @@ class Model:
             )
 
             reduce_k, reduce_v = hidden_mult * shardops.einsum_unreduced(
-                "B/d n_blocks block_size d_model, k_v d_model n_kv/t d_head -> k_v B/d n_blocks block_size n_kv/t d_head",
+                "B/d n_blocks concept_size d_model, k_v d_model n_kv/t d_head -> k_v B/d n_blocks concept_size n_kv/t d_head",
                 x,
                 w_reduce_kv,
             )
             logits = shardops.einsum_unreduced(
-                "1 n_q_per_kv n_kv/t d_head, B/d n_blocks block_size n_kv/t d_head -> B/d 1 n_blocks block_size n_q_per_kv n_kv/t",
+                "1 n_q_per_kv n_kv/t d_head, B/d n_blocks concept_size n_kv/t d_head -> B/d 1 n_blocks concept_size n_q_per_kv n_kv/t",
                 w_reduce_q,
                 reduce_k,
                 preferred_element_type=jnp.float32,
@@ -974,7 +964,7 @@ class Model:
             attn_wei = jnp.bfloat16(jax.nn.softmax(logits, axis=-1))
 
             attn_out = shardops.einsum_unreduced(
-                "B/d 1 n_blocks block_size n_q_per_kv n_kv/t, B/d n_blocks block_size n_kv/t d_head -> B/d n_blocks n_q_per_kv n_kv/t d_head",
+                "B/d 1 n_blocks concept_size n_q_per_kv n_kv/t, B/d n_blocks concept_size n_kv/t d_head -> B/d n_blocks n_q_per_kv n_kv/t d_head",
                 attn_wei,
                 reduce_v,
             )
